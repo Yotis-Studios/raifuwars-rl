@@ -211,19 +211,56 @@ class WarriorEnv:
         return getattr(self, "_acts", [])
 
 
-def default_reward(prev, cur, end_payload):
-    """Shaped on TIER, lightly on stars, because tiering is the only thing that wins.
+def _progress(me):
+    """How far this seat is toward its NEXT tier, in 0..1. Saturating, on purpose."""
+    tp = (me or {}).get("tier_progress") or {}
+    try:
+        need = float(tp.get("need", 0))
+        have = float(tp.get("have", 0))
+    except (TypeError, ValueError):
+        return 1.0
+    if need <= 0:                      # tier 4, or the game could not name a threshold
+        return 1.0
+    return min(1.0, max(0.0, have / need))
 
-    The failure mode this is arranged against has already been observed in a trained LLM on this
-    exact game: it accumulated 838 stars a match -- half the built-in AI's rate -- reached tier
-    2.05, and won 2 matches in 40. Stars are a means; a policy rewarded on them will farm points
-    and never climb. So tier gains dominate and stars are worth little.
+
+def default_reward(prev, cur, end_payload):
+    """TIERS ARE THE REWARD. Everything else is shaped toward reaching the next one.
+
+    Reaching tier 4 ends the match and wins it; nothing else does. So a tier gained is the event
+    worth paying for, and the last one is worth most because it is the one that wins -- hence the
+    escalating scale rather than a flat rate.
+
+    THE PROGRESS TERM IS WHY STARS ARE NOT REWARDED DIRECTLY. `tier_progress` is have/need against
+    this seat's own track -- stars or KOs, whichever it is on -- and it SATURATES at 1.0. Earning
+    stars you already have enough of is worth exactly zero, which is true: at the threshold the
+    only useful move is to walk to your base and tier. A raw stars term cannot express that, and a
+    policy given one farms points forever.
+
+    That is not hypothetical here. A fine-tuned LLM on this game accumulated 838 stars a match --
+    against the built-in AI's 1683 -- reached tier 2.05, and won 2 matches in 40. It had found the
+    means and stopped. An RL agent rewarded the same way will find it faster and hold it harder.
+
+    Potential-based in shape: the progress term is a difference of a bounded function of state, so
+    it moves the agent toward thresholds without changing which policy is optimal.
     """
     if end_payload is not None:
         return 10.0 if end_payload.get("won") else 0.0
     if not prev or not cur:
         return 0.0
     a, b = prev.get("self") or {}, cur.get("self") or {}
-    d_tier = float(b.get("tier", 0)) - float(a.get("tier", 0))
-    d_stars = float(b.get("stars", 0)) - float(a.get("stars", 0))
-    return 3.0 * d_tier + 0.001 * d_stars
+
+    t0, t1 = float(a.get("tier", 0)), float(b.get("tier", 0))
+    r = 0.0
+    if t1 > t0:
+        # 1 -> 2 -> 3 -> 5 for tiers 1..4. The fourth is the win, and a flat rate would price the
+        # decisive tier the same as the first routine one.
+        for t in range(int(t0) + 1, int(t1) + 1):
+            r += {1: 1.0, 2: 2.0, 3: 3.0, 4: 5.0}.get(t, 1.0)
+
+    # Progress toward the next threshold. Small: it is a hint about direction, not a goal. On a
+    # tier-up `have` resets against a larger `need`, so this term goes sharply negative exactly
+    # when the tier bonus fires -- suppressed, or the agent is punished for the thing it is for.
+    if t1 == t0:
+        r += 1.0 * (_progress(b) - _progress(a))
+    return r
