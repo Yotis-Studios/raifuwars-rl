@@ -45,6 +45,18 @@ class Server(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
+    # KEEP-ALIVE AND NO NAGLE. BaseHTTPRequestHandler speaks HTTP/1.0 by default, so the socket
+    # is torn down and rebuilt for EVERY decision -- a full TCP handshake per action, thousands of
+    # times a match. HTTP/1.1 reuses the connection (Content-Length is already sent on every
+    # reply, which is what makes that safe).
+    #
+    # disable_nagle_algorithm sets TCP_NODELAY. Nagle holds a small write back waiting for more
+    # data while the peer's delayed-ACK holds the acknowledgement waiting for a response -- the
+    # classic ~40ms stall, and a request/response pair of a few hundred bytes is exactly the
+    # shape that triggers it.
+    protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True
+
     def log_message(self, *a):
         pass
 

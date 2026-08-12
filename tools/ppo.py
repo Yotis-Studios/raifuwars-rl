@@ -179,69 +179,66 @@ def main():
         update += 1
         rolls = [Rollout() for _ in range(args.envs)]
 
-        for _ in range(args.steps):
-            svecs = [encode_state(o.state) for o in obs]
-            # A decision with no offered actions cannot happen -- the protocol forbids asking
-            # with an empty legal set -- but a one-row zero matrix keeps a malformed payload from
-            # taking the whole run down at hour four.
-            amats = [encode_actions(o.state, o.actions) if o.actions
-                     else np.zeros((1, D_ACTION), dtype=np.float32) for o in obs]
-            # NON-FINITE FEATURES ARE FATAL TO A SAMPLED POLICY and silent to a greedy one:
-            # argmax over a vector containing nan returns something, multinomial raises. Serving
-            # the BC checkpoint greedily for 160 tournament matches therefore never surfaced this,
-            # and PPO hit it on the first update.
-            #
-            # Reported by FEATURE NAME the first few times rather than quietly repaired. A column
-            # that goes non-finite on live states but not on the corpus is a real difference
-            # between the two distributions, and sanitising it without looking would train the
-            # policy on a zero that means "unknown" while reading as "measured zero".
-            for i, (sv, am) in enumerate(zip(svecs, amats)):
+        # EACH ENV COLLECTS ITS OWN ROLLOUT, IN ITS OWN THREAD. This was a barrier: every step
+        # ran `pool.map` over all envs, so each decision waited on the SLOWEST env -- and worse,
+        # when a match ended the replacement game was launched INLINE, several seconds of process
+        # start-up during which the other three envs sat blocked at the barrier doing nothing.
+        #
+        # Stepping independently means a reset stalls only the env that is resetting. Nothing here
+        # needs synchronising: the rollouts are per-env by construction (GAE is computed per
+        # trajectory precisely so they are never mixed), and the network is read-only during
+        # collection -- no gradients, no mutation, and torch releases the GIL for the forward.
+        def collect(i):
+            ob = obs[i]
+            roll = rolls[i]
+            for _ in range(args.steps):
+                sv = encode_state(ob.state)
+                am = (encode_actions(ob.state, ob.actions) if ob.actions
+                      else np.zeros((1, D_ACTION), dtype=np.float32))
+
+                # Reported by name the first few times rather than quietly repaired -- a column
+                # that goes non-finite on live states but not on the corpus is a real difference
+                # between the two distributions.
                 if not np.all(np.isfinite(sv)):
                     bad = [STATE_FIELDS[k] for k in np.where(~np.isfinite(sv))[0]]
                     nonfinite["state"] += 1
                     if nonfinite["state"] <= 3:
-                        print("[ppo] non-finite STATE features %s -- sanitising" % bad, flush=True)
-                    svecs[i] = np.nan_to_num(sv, nan=0.0, posinf=0.0, neginf=0.0)
+                        print("[ppo] non-finite STATE %s -- sanitising" % bad, flush=True)
+                    sv = np.nan_to_num(sv, nan=0.0, posinf=0.0, neginf=0.0)
                 if not np.all(np.isfinite(am)):
                     cols = sorted({int(c) for c in np.where(~np.isfinite(am))[1]})
-                    bad = [ACTION_FIELDS[c] for c in cols if c < len(ACTION_FIELDS)]
                     nonfinite["action"] += 1
                     if nonfinite["action"] <= 3:
-                        print("[ppo] non-finite ACTION features %s -- sanitising" % bad, flush=True)
-                    amats[i] = np.nan_to_num(am, nan=0.0, posinf=0.0, neginf=0.0)
+                        print("[ppo] non-finite ACTION %s -- sanitising"
+                              % [ACTION_FIELDS[c] for c in cols if c < len(ACTION_FIELDS)],
+                              flush=True)
+                    am = np.nan_to_num(am, nan=0.0, posinf=0.0, neginf=0.0)
 
-            with torch.no_grad():
-                picks = []
-                for i, (sv, am) in enumerate(zip(svecs, amats)):
-                    s = torch.tensor(sv, device=device)
-                    a = torch.tensor(am, device=device)
-                    logits = net(s, a)
+                with torch.no_grad():
+                    st = torch.tensor(sv, device=device)
+                    at = torch.tensor(am, device=device)
+                    logits = net(st, at)
                     if not torch.all(torch.isfinite(logits)):
-                        # The features were clean, so this is the network. Uniform over the
-                        # offered set keeps the episode alive and the count makes it visible.
                         nonfinite["logits"] += 1
                         logits = torch.zeros_like(logits)
                     probs = torch.softmax(logits, dim=0)
                     j = int(torch.multinomial(probs, 1).item())
-                    picks.append((j, float(torch.log(probs[j] + 1e-9)),
-                                  float(net.value_of(s))))
+                    lp = float(torch.log(probs[j] + 1e-9))
+                    v = float(net.value_of(st))
 
-            results = list(pool.map(lambda p: p[0].step(p[1]),
-                                    [(envs[i], picks[i][0]) for i in range(args.envs)]))
-
-            for i, step in enumerate(results):
-                j, lp, v = picks[i]
-                rolls[i].add(svecs[i], amats[i], j, lp, v, step.reward, step.done)
+                step = envs[i].step(j)
+                roll.add(sv, am, j, lp, v, step.reward, step.done)
                 ep_returns[i] += step.reward
                 if step.done:
                     finished.append(ep_returns[i])
                     ep_returns[i] = 0.0
-                    # A finished match must be replaced or the env has nothing to step into.
-                    # Done inline rather than lazily: a stale Step would be silently re-stepped.
-                    obs[i] = envs[i].reset()
+                    ob = envs[i].reset()
                 else:
-                    obs[i] = step
-            total_steps += args.envs
+                    ob = step
+            obs[i] = ob
+
+        list(pool.map(collect, range(args.envs)))
+        total_steps += args.envs * args.steps
 
         # -- advantages, per env so trajectories are not mixed across boundaries -------------
         with torch.no_grad():
