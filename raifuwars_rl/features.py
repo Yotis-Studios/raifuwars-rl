@@ -59,6 +59,21 @@ def _f(v, default=0.0):
     return default if (math.isnan(x) or math.isinf(x)) else x
 
 
+def _point_radius(pt):
+    """How far a point's territory reaches, in chebyshev tiles.
+
+    The game sends this as `radius`. Older corpora predate the field, but `radius` and
+    `stars_per_turn` are the same number on the game's side -- `point.value` served as both, which
+    is precisely why the extent was invisible for so long -- so the fallback is exact rather than
+    a guess.
+    """
+    r = pt.get("radius")
+    if r is None:
+        r = pt.get("stars_per_turn")
+    r = _f(r, 1.0)
+    return r if r > 0 else 1.0
+
+
 def _cheb(ax, ay, bx, by):
     return max(abs(ax - bx), abs(ay - by))
 
@@ -109,7 +124,11 @@ def encode_state(state):
         rel = pt.get("relationship")
         if pt.get("is_base"):
             if int(_f(pt.get("held_by_seat"), -1)) == seat:
-                d_base = min(d_base, d)
+                # Distance to the base's EDGE, not its centre. The point covers a chebyshev
+                # square of half-width `radius`, so a raifu one tile off the centre is already
+                # standing where it may tier -- and this feature exists to say "how far from
+                # being able to win", which at that moment is zero, not one.
+                d_base = min(d_base, max(0.0, d - _point_radius(pt)))
             continue
         if rel == "friendly":
             mine += 1
@@ -208,9 +227,17 @@ def encode_actions(state, actions):
             if xy:
                 tx, ty = xy
                 row[base + 0] = _cheb(mx, my, tx, ty) / span
+                # A POINT IS A SQUARE, NOT A TILE. `playerIsInPoint` tests a chebyshev square of
+                # half-width `radius`, so a base with radius 1 can be tiered from any of NINE
+                # tiles. This asked for exact equality, which marked eight of those nine as "not
+                # a base" -- on the only feature that identifies the winning tile.
+                #
+                # That is the original `is_base` bug one layer up: not a field that was always
+                # false, but a field that was true one ninth as often as it should be, which is
+                # far harder to see. check_features would report it as alive and plausible.
                 for pt in pts:
                     t = pt.get("tile") or [0, 0]
-                    if _f(t[0]) == tx and _f(t[1]) == ty:
+                    if _cheb(_f(t[0]), _f(t[1]), tx, ty) <= _point_radius(pt):
                         if pt.get("is_base"):
                             row[base + 2] = 1.0
                         elif pt.get("relationship") != "friendly":
