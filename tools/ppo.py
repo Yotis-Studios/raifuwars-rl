@@ -41,7 +41,8 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from raifuwars_rl.env import WarriorEnv                            # noqa: E402
-from raifuwars_rl.features import D_ACTION, encode_actions, encode_state  # noqa: E402
+from raifuwars_rl.features import (ACTION_FIELDS, D_ACTION, STATE_FIELDS,  # noqa: E402
+                                   encode_actions, encode_state)
 from raifuwars_rl.policy import ActionScorer, masked_log_probs     # noqa: E402
 
 
@@ -105,6 +106,13 @@ def main():
     ap.add_argument("--out", default="runs/ppo")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--map", default="")
+    ap.add_argument("--seats", default="0,1,2,3",
+                    help="seat rotation -- which start base the agent occupies, varied per "
+                         "episode. Turn order is a fixed rotation and spawns differ, so a policy "
+                         "parked on one seat is being trained on that seat.")
+    ap.add_argument("--maps", default="",
+                    help="comma-separated boards, cycled across envs -- training on one map is "
+                         "how the 4B ended up losing 20pp of move accuracy off its trained board")
     ap.add_argument("--runner", default=os.environ.get("RW_RUNNER", ""))
     ap.add_argument("--game", default=os.environ.get("RW_GAME", ""))
     args = ap.parse_args()
@@ -118,9 +126,41 @@ def main():
         print("[ppo] warm-started from %s" % args.init, flush=True)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
 
+    # ONE MAP PER ENV, CYCLED. Every spatial failure measured on this game came from training on
+    # a single board: the 4B held 100% on every categorical family off-map and lost move 78->58%
+    # and rush 50->24%. An RL policy fed one board learns that board's geometry for free and has
+    # no reason not to.
+    # "Name:seats" -- the roster size is a property of the BOARD (its start-base count), so it
+    # belongs beside the name rather than in a global seat list that cannot know which map it is
+    # being applied to.
+    maps = []
+    for entry in (args.maps.split(",") if args.maps else []):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" in entry:
+            name, n = entry.rsplit(":", 1)
+            maps.append((name.strip(), int(n)))
+        else:
+            maps.append((entry, 4))
+    if not maps and args.map:
+        maps = [(args.map, 4)]
+
+    combos = [(name, seat) for name, n in maps for seat in range(n)]
+    if not combos:
+        combos = [(None, 0)]
+    seats = sorted({c[1] for c in combos})
+    # EVERY env gets the WHOLE pool and rotates through it per episode, offset so they are on
+    # different boards at any given moment. Handing env i only map i would fix each env to one
+    # board for the whole run -- four conditions rather than coverage of four.
     envs = [WarriorEnv(runner=args.runner, game=args.game, port=args.port + i,
-                       seat=0, map_name=args.map or None, seed_base=900000 + i * 100000)
+                       combos=combos, rotate_offset=(i * 3) % max(1, len(combos)),
+                       seed_base=900000 + i * 100000)
             for i in range(args.envs)]
+    print("[ppo] %d envs rotating over %d (map, seat) pairs: %s"
+          % (args.envs, len(combos),
+             ", ".join("%s#%d" % c for c in combos[:6]) + (" ..." if len(combos) > 6 else "")),
+          flush=True)
     pool = ThreadPoolExecutor(max_workers=args.envs)
 
     print("[ppo] resetting %d envs (each launches a real match)" % args.envs, flush=True)
@@ -132,6 +172,7 @@ def main():
     t_end = time.time() + args.hours * 3600.0
     update = 0
     total_steps = 0
+    nonfinite = collections.Counter()
     logf = open(os.path.join(args.out, "train.jsonl"), "a", encoding="utf-8")
 
     while time.time() < t_end:
@@ -145,12 +186,41 @@ def main():
             # taking the whole run down at hour four.
             amats = [encode_actions(o.state, o.actions) if o.actions
                      else np.zeros((1, D_ACTION), dtype=np.float32) for o in obs]
+            # NON-FINITE FEATURES ARE FATAL TO A SAMPLED POLICY and silent to a greedy one:
+            # argmax over a vector containing nan returns something, multinomial raises. Serving
+            # the BC checkpoint greedily for 160 tournament matches therefore never surfaced this,
+            # and PPO hit it on the first update.
+            #
+            # Reported by FEATURE NAME the first few times rather than quietly repaired. A column
+            # that goes non-finite on live states but not on the corpus is a real difference
+            # between the two distributions, and sanitising it without looking would train the
+            # policy on a zero that means "unknown" while reading as "measured zero".
+            for i, (sv, am) in enumerate(zip(svecs, amats)):
+                if not np.all(np.isfinite(sv)):
+                    bad = [STATE_FIELDS[k] for k in np.where(~np.isfinite(sv))[0]]
+                    nonfinite["state"] += 1
+                    if nonfinite["state"] <= 3:
+                        print("[ppo] non-finite STATE features %s -- sanitising" % bad, flush=True)
+                    svecs[i] = np.nan_to_num(sv, nan=0.0, posinf=0.0, neginf=0.0)
+                if not np.all(np.isfinite(am)):
+                    cols = sorted({int(c) for c in np.where(~np.isfinite(am))[1]})
+                    bad = [ACTION_FIELDS[c] for c in cols if c < len(ACTION_FIELDS)]
+                    nonfinite["action"] += 1
+                    if nonfinite["action"] <= 3:
+                        print("[ppo] non-finite ACTION features %s -- sanitising" % bad, flush=True)
+                    amats[i] = np.nan_to_num(am, nan=0.0, posinf=0.0, neginf=0.0)
+
             with torch.no_grad():
                 picks = []
                 for i, (sv, am) in enumerate(zip(svecs, amats)):
                     s = torch.tensor(sv, device=device)
                     a = torch.tensor(am, device=device)
                     logits = net(s, a)
+                    if not torch.all(torch.isfinite(logits)):
+                        # The features were clean, so this is the network. Uniform over the
+                        # offered set keeps the episode alive and the count makes it visible.
+                        nonfinite["logits"] += 1
+                        logits = torch.zeros_like(logits)
                     probs = torch.softmax(logits, dim=0)
                     j = int(torch.multinomial(probs, 1).item())
                     picks.append((j, float(torch.log(probs[j] + 1e-9)),
@@ -208,7 +278,18 @@ def main():
 
                 v = net.value_of(S[sl])
                 vloss = F.mse_loss(v, RET[sl])
-                ent = -(lp.exp() * lp).nan_to_num(0.0).sum(1).mean()
+                # ENTROPY OVER PADDED ROWS IS A NaN FACTORY, and `nan_to_num` on the result does
+                # not save you: padding is -inf, so exp(-inf) * -inf is 0 * -inf = nan, and
+                # zeroing the VALUE in the forward pass leaves the nan to arrive through the
+                # BACKWARD pass anyway. One update was enough to turn every weight to nan, after
+                # which every logit was nan, every action was sampled uniformly, and the run
+                # carried on looking like it was training -- returns still printed, checkpoints
+                # still written, kl quietly NaN.
+                #
+                # Clamping BEFORE the product keeps it finite end to end: exp(-1e9) underflows to
+                # 0 and 0 * -1e9 is 0, with no nan for autograd to propagate.
+                lp_safe = torch.nan_to_num(lp, neginf=-1e9)
+                ent = -(lp_safe.exp() * lp_safe).sum(1).mean()
 
                 loss = pg + args.vf * vloss - args.ent * ent
                 opt.zero_grad(); loss.backward()
@@ -225,6 +306,7 @@ def main():
         mean_ret = float(np.mean(finished)) if finished else float("nan")
         rec = {"update": update, "steps": total_steps, "episodes": len(finished),
                "mean_return": mean_ret, "kl": stop_kl,
+               "nonfinite": dict(nonfinite),
                "elapsed_min": round((time.time() - (t_end - args.hours * 3600)) / 60, 1)}
         print("[ppo] %s" % json.dumps(rec), flush=True)
         logf.write(json.dumps(rec) + "\n"); logf.flush()

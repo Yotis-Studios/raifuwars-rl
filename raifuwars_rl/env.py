@@ -87,14 +87,42 @@ class _Handler(BaseHTTPRequestHandler):
 
 class WarriorEnv:
     def __init__(self, runner, game, port=8931, seat=0, map_name=None, seed_base=500000,
-                 reward=None, launch_timeout=180.0):
+                 reward=None, launch_timeout=180.0, maps=None, seats=None, rotate_offset=0,
+                 combos=None, reset_retries=3):
+        """`maps` and `seats` VARY PER EPISODE, which is not the same as varying per env.
+
+        Fixing a board and a seat at construction means env 0 plays Arboretum from seat 0 for the
+        entire run: four envs give four fixed conditions, not coverage of them. The policy then
+        has every opportunity to learn one board's geometry and one seat's turn position, and
+        nothing in the return would reveal it -- this is the same failure that cost the 4B twenty
+        points of move accuracy off its trained board.
+
+        Rotated by episode and offset per env, so the four envs are on different boards at any
+        moment (no thundering herd on one map) and each sees all of them over time. Deterministic
+        rather than random: a surprising episode can be replayed.
+        """
         self.runner = runner
         self.game = game
         self.port = port
-        self.seat = seat
-        self.map_name = map_name
+        # (map, seat) PAIRS, NOT TWO INDEPENDENT LISTS. A seat only exists if the map seats it:
+        # Twin Rivers has two start bases, so rotating a seat index 0..3 across it asks for seat 2
+        # of a two-player board. Nothing rejects that -- the warrior is simply never installed, the
+        # match plays itself out with the built-in AI, and the env sees a game that exited without
+        # ever asking for a decision. It killed a 9-hour run 25 minutes in.
+        #
+        # Pairing them makes the invalid combination unrepresentable rather than merely unlikely,
+        # which is the same argument as indexing the offered action list instead of naming an id.
+        if combos:
+            self.combos = [(m, int(t)) for m, t in combos]
+        else:
+            ms = list(maps) if maps else ([map_name] if map_name else [None])
+            ts = list(seats) if seats else [seat]
+            self.combos = [(m, t) for t in ts for m in ms]
+        self.rotate_offset = rotate_offset
+        self.map_name, self.seat = self.combos[0]
         self.seed_base = seed_base
         self.launch_timeout = launch_timeout
+        self.reset_retries = reset_retries
         self.reward_fn = reward or default_reward
 
         self._to_agent = queue.Queue()
@@ -112,6 +140,13 @@ class WarriorEnv:
     # -- lifecycle ---------------------------------------------------------
 
     def _launch(self):
+        # Chosen here rather than in reset() so the values used are exactly the ones handed to the
+        # process, with no window in which self.seat says one thing and the game was told another.
+        # One step through the pre-paired list per episode, offset per env so four envs are on
+        # four different boards at any moment rather than all reaching Twin Rivers together.
+        k = self._episode + self.rotate_offset
+        self.map_name, self.seat = self.combos[k % len(self.combos)]
+
         env = dict(os.environ)
         env.update({
             "RW_UI_CAPTURE": "1",
@@ -163,6 +198,24 @@ class WarriorEnv:
     # -- gym surface -------------------------------------------------------
 
     def reset(self):
+        """Retries before giving up. A single failed launch used to end the run: PPO calls reset()
+        inline whenever a match finishes, so one bad episode at hour four takes the other eight
+        hours with it. Retrying costs a minute; not retrying cost a night."""
+        last = None
+        for attempt in range(max(1, self.reset_retries)):
+            try:
+                return self._reset_once()
+            except (RuntimeError, TimeoutError) as e:                # noqa: PERF203
+                last = e
+                print("[env] reset failed on %s seat %s (attempt %d/%d): %s"
+                      % (self.map_name, self.seat, attempt + 1, self.reset_retries, e), flush=True)
+                self._kill()
+                # Advance the rotation rather than retrying the identical launch -- if this
+                # combination is the problem, repeating it just fails three times.
+                self._episode += 1
+        raise last
+
+    def _reset_once(self):
         self._kill()
         self._drain()
         self._prev = None
