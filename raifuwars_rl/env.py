@@ -126,8 +126,15 @@ class WarriorEnv:
             # only ui-capture.sh translates. Getting this wrong silently plays the default map
             # while reporting the one you asked for.
             env["RW_UI_CAPTURE_MAP"] = self.map_name
+        # CWD IS THE GAME'S DIRECTORY, NOT THE LEARNER'S. A GameMaker build resolves its included
+        # files relative to the working directory, so launching it from anywhere else gives a
+        # runner that starts, finds no datafiles, and exits before it ever asks for a decision --
+        # which arrives here as "game exited before asking for a decision" and reads like a
+        # protocol fault. Verified by running the same Runner by hand from the build directory,
+        # where it plays a full match.
         self._proc = subprocess.Popen(
             [self.runner, "-game", self.game],
+            cwd=os.path.dirname(os.path.abspath(self.game)) or None,
             env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def close(self):
@@ -264,3 +271,30 @@ def default_reward(prev, cur, end_payload):
     if t1 == t0:
         r += 1.0 * (_progress(b) - _progress(a))
     return r
+
+
+# ---------------------------------------------------------------------------
+# KNOWN BLOCKER (Aug 12): the bare-Runner path does not install the warrior seat.
+#
+# Launching `Runner.exe -game RaifuWars.win` with RW_WARRIOR_URL / RW_WARRIOR_SEATS set plays a
+# complete match -- `[aitrial] RESULT ... policy=classic turns=86` -- and never contacts the
+# sidecar. `warriorSeatUrl` logs "[warrior] sidecar at <url> for seats <n>" the first time it
+# resolves, and that line does not appear, so RW_WARRIOR_URL is reaching the process as undefined.
+# Confirmed from the other side too: a sidecar left listening on the port logs zero requests.
+#
+# The tournament harness works because it goes through `igor_run Run`, which sets up the
+# environment differently. So this is about how the variables reach a bare Runner, not about the
+# protocol, the port, or this file's threading.
+#
+# WHERE TO LOOK FIRST. `RW_MAP` failed twice before for the same class of reason -- a bash prefix
+# that was not an assignment, then the wrong variable name -- so check what the process actually
+# receives before changing anything here:
+#
+#   1. print `environment_get_variable("RW_WARRIOR_URL")` at boot, or run the Runner from a shell
+#      that has the variables EXPORTED rather than prefixed, and see whether the [warrior] line
+#      appears
+#   2. compare against `igor_run`'s environment (tools/gm-env.sh) for anything else it sets
+#   3. only then suspect this file
+#
+# Until it is resolved, PPO cannot collect. `tools/serve.py` measures a checkpoint through the
+# igor_run tournament harness and is unaffected.
