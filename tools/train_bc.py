@@ -42,9 +42,32 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from outcomes import outcomes                                     # noqa: E402
 
 
-def load(traces, weight_mode, limit=0):
+def is_ffa(state):
+    """Is every seat its own team? Free-for-all is `numTeams == numPlayers` in the game.
+
+    TEAM MATCHES ARE DROPPED BY DEFAULT, because tier and stars are SHARED within a team. A seat
+    on a 3v3 reads its team-mates' tier as its own, so its objective advances on turns it did not
+    take -- 435 of 1520 seats in the v3 corpus finished above the last tier they personally
+    observed. As imitation data that teaches a state-to-action mapping whose state is partly
+    somebody else's; as RL it puts unattributable credit in the return.
+
+    The 3v3s were never a design choice. `loadBasesFromMapJSON` set numPlayers without
+    re-establishing free-for-all, so a six-seat map ran numPlayers/numTeams = 6/4 = 1.5 and a
+    fractional modulo split the roster in half. Fixed in the game, but the corpus predates it,
+    so the filter stays for reading anything collected before.
+    """
+    players = (state or {}).get("players") or []
+    if not players:
+        return True
+    teams = collections.Counter(int(float(p.get("team", -1))) for p in players)
+    return all(c == 1 for c in teams.values())
+
+
+def load(traces, weight_mode, limit=0, allow_teams=False):
     finals = outcomes(traces) if weight_mode != "none" else {}
     rows = []
+    team_seen = {}
+    dropped = 0
     for path in traces:
         with open(path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -66,6 +89,15 @@ def load(traces, weight_mode, limit=0):
 
                 key = (d.get("map", "?"), d.get("match_id", "?"))
                 seat = int(float(d.get("seat", -1)))
+
+                st = d.get("state") or {}
+                if not allow_teams:
+                    if key not in team_seen:
+                        team_seen[key] = is_ffa(st)
+                    if not team_seen[key]:
+                        dropped += 1
+                        continue
+
                 w = 1.0
                 if weight_mode != "none":
                     seats = finals.get(key) or {}
@@ -81,11 +113,10 @@ def load(traces, weight_mode, limit=0):
                     if w <= 0.0:
                         continue
 
-                st = d.get("state") or {}
                 rows.append((key, encode_state(st), encode_actions(st, acts), idx, w))
                 if limit and len(rows) >= limit:
-                    return rows
-    return rows
+                    return rows, dropped
+    return rows, dropped
 
 
 def batches(rows, size, rng, device):
@@ -114,10 +145,12 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--allow-teams", action="store_true",
+                    help="keep team matches (tier and stars are shared within a team)")
     args = ap.parse_args()
 
     t0 = time.time()
-    rows = load(args.traces, args.weight, args.limit)
+    rows, dropped = load(args.traces, args.weight, args.limit, args.allow_teams)
     if not rows:
         print("no usable rows")
         return 1
@@ -131,6 +164,10 @@ def main():
 
     print("rows %d (%d train / %d val) from %d matches, weight=%s, loaded in %.0fs"
           % (len(rows), len(train), len(val), len(keys), args.weight, time.time() - t0))
+    if dropped:
+        print("  dropped %d rows from team matches (tier and stars are shared within a team,"
+              " so a seat's objective advances on turns it did not take). --allow-teams keeps them."
+              % dropped)
 
     device = torch.device(args.device)
     net = ActionScorer().to(device)
