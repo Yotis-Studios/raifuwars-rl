@@ -44,6 +44,7 @@ from raifuwars_rl.env import WarriorEnv                            # noqa: E402
 from raifuwars_rl.features import (ACTION_FIELDS, D_ACTION, STATE_FIELDS,  # noqa: E402
                                    encode_actions, encode_state)
 from raifuwars_rl.policy import ActionScorer, masked_log_probs     # noqa: E402
+from raifuwars_rl.simenv import SimEnv                             # noqa: E402
 
 
 class Rollout:
@@ -115,6 +116,17 @@ def main():
                          "how the 4B ended up losing 20pp of move accuracy off its trained board")
     ap.add_argument("--runner", default=os.environ.get("RW_RUNNER", ""))
     ap.add_argument("--game", default=os.environ.get("RW_GAME", ""))
+    # THE ONLY THING --sim CHANGES IS WHERE THE TRANSITIONS COME FROM. SimEnv has the same
+    # surface as WarriorEnv and imports `default_reward` from it unchanged, so a return measured
+    # here is the same number a return measured on the real game is -- which is the entire reason
+    # to have a fast environment: two sets of numbers that cannot be compared are one set.
+    ap.add_argument("--sim", default="",
+                    help="path to raifusim/driver.hml -- use the Hemlock simulator instead of a "
+                         "real GameMaker match (~35x the throughput, no cards)")
+    ap.add_argument("--sim-hemlock", default="/usr/local/bin/hemlock")
+    ap.add_argument("--sim-policy", default="greedy",
+                    help="what the OTHER seats play in the simulator: greedy or random")
+    ap.add_argument("--sim-seed", type=int, default=20250813)
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -153,14 +165,28 @@ def main():
     # EVERY env gets the WHOLE pool and rotates through it per episode, offset so they are on
     # different boards at any given moment. Handing env i only map i would fix each env to one
     # board for the whole run -- four conditions rather than coverage of four.
-    envs = [WarriorEnv(runner=args.runner, game=args.game, port=args.port + i,
-                       combos=combos, rotate_offset=(i * 3) % max(1, len(combos)),
-                       seed_base=900000 + i * 100000)
-            for i in range(args.envs)]
-    print("[ppo] %d envs rotating over %d (map, seat) pairs: %s"
-          % (args.envs, len(combos),
-             ", ".join("%s#%d" % c for c in combos[:6]) + (" ..." if len(combos) > 6 else "")),
-          flush=True)
+    if args.sim:
+        # The driver already refuses a seat the board does not have, so the whole seat range goes
+        # to every env and the impossible pairs are dropped there rather than being enumerated
+        # twice in two places that can disagree.
+        sim_maps = maps or [("Dustbowl", 4)]
+        sim_seats = sorted({s for _, n in sim_maps for s in range(n)})
+        envs = [SimEnv(driver=args.sim, hemlock=args.sim_hemlock, maps=sim_maps,
+                       seats=sim_seats, policy=args.sim_policy,
+                       seed=args.sim_seed, rotate_offset=i)
+                for i in range(args.envs)]
+        print("[ppo] %d SIM envs over %d boards (%s), opponents=%s"
+              % (args.envs, len(sim_maps),
+                 ", ".join("%s:%d" % m for m in sim_maps), args.sim_policy), flush=True)
+    else:
+        envs = [WarriorEnv(runner=args.runner, game=args.game, port=args.port + i,
+                           combos=combos, rotate_offset=(i * 3) % max(1, len(combos)),
+                           seed_base=900000 + i * 100000)
+                for i in range(args.envs)]
+        print("[ppo] %d envs rotating over %d (map, seat) pairs: %s"
+              % (args.envs, len(combos),
+                 ", ".join("%s#%d" % c for c in combos[:6]) + (" ..." if len(combos) > 6 else "")),
+              flush=True)
     pool = ThreadPoolExecutor(max_workers=args.envs)
 
     print("[ppo] resetting %d envs (each launches a real match)" % args.envs, flush=True)
@@ -237,7 +263,12 @@ def main():
                     ob = step
             obs[i] = ob
 
+        t_collect = time.time()
         list(pool.map(collect, range(args.envs)))
+        # AGENT DECISIONS PER SECOND, measured over collection only. The optimiser runs on the
+        # same clock but is not what the throughput claim is about, and mixing the two in hides a
+        # regression in either one.
+        collect_sec = time.time() - t_collect
         total_steps += args.envs * args.steps
 
         # -- advantages, per env so trajectories are not mixed across boundaries -------------
@@ -303,6 +334,7 @@ def main():
         mean_ret = float(np.mean(finished)) if finished else float("nan")
         rec = {"update": update, "steps": total_steps, "episodes": len(finished),
                "mean_return": mean_ret, "kl": stop_kl,
+               "steps_per_sec": round(args.envs * args.steps / max(1e-9, collect_sec), 1),
                "nonfinite": dict(nonfinite),
                "elapsed_min": round((time.time() - (t_end - args.hours * 3600)) / 60, 1)}
         print("[ppo] %s" % json.dumps(rec), flush=True)

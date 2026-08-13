@@ -57,8 +57,23 @@ class _Handler(BaseHTTPRequestHandler):
     # data while the peer's delayed-ACK holds the acknowledgement waiting for a response -- the
     # classic ~40ms stall, and a request/response pair of a few hundred bytes is exactly the
     # shape that triggers it.
-    protocol_version = "HTTP/1.1"
+    # HTTP/1.0 ON PURPOSE. Keep-alive was tried and reverted: GameMaker's client does not hold
+    # the connection, so every episode end reset a socket the server was still holding and the
+    # handler threads threw ConnectionResetError [WinError 10054] in a flood. It bought ~75ms a
+    # decision and cost the run.
+    #
+    # TCP_NODELAY stays -- it is free and it is the half that was actually helping. Nagle holds a
+    # small write waiting for more data while the peer's delayed ACK waits for a response, which
+    # is the classic ~40ms stall on request/response pairs this size.
     disable_nagle_algorithm = True
+
+    def handle_one_request(self):
+        # A game that exits mid-connection is NORMAL here -- an episode ending is a process
+        # ending. Logging a traceback per occurrence buried the run's own output.
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            self.close_connection = True
 
     def log_message(self, *a):
         pass
@@ -95,6 +110,17 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True})
         else:
             self._send(200, {"ok": True})
+
+
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+    # BLOCK_ON_CLOSE=FALSE, OR EVERY REQUEST LEAKS ITS THREAD OBJECT. ThreadingMixIn keeps a
+    # list of spawned threads when `block_on_close` is true -- which it is by default -- so it
+    # only ever grows, and with HTTP/1.0 that is one Thread per DECISION. Measured: a sidecar
+    # left running across one 160-match tournament reached 35 GB resident and starved the game,
+    # which then died in oInit with "Memory allocation failed" and hung on a modal crash dialog.
+    # The tournament sat there for 43 minutes looking like a slow match.
+    block_on_close = False
 
 
 class WarriorEnv:
@@ -144,7 +170,7 @@ class WarriorEnv:
         self._prev = None
         self._acts = []
 
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
+        self._httpd = _Server(("127.0.0.1", port), _Handler)
         self._httpd.env = self
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()

@@ -30,7 +30,7 @@ import json
 import os
 import sys
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import numpy as np
 import torch
@@ -40,22 +40,43 @@ from raifuwars_rl.features import encode_actions, encode_state    # noqa: E402
 from raifuwars_rl.policy import ActionScorer                      # noqa: E402
 
 
-class Server(ThreadingHTTPServer):
-    daemon_threads = True
+class Server(HTTPServer):
+    """SINGLE-THREADED, AND THAT IS THE FIX.
+
+    This was a ThreadingHTTPServer, and its handler threads never exited: measured at ~7 surviving
+    threads and 3.8 MB per request, which projects to 36 GB over one 160-match tournament. That is
+    exactly what happened -- a sidecar reached 28-35 GB, the machine ran out, the game died in
+    oInit with "Memory allocation failed", and because Snitch's crash dialog is modal the process
+    then sat there while the tournament looked like a slow match for 43 minutes.
+
+    An earlier fix set `block_on_close = False` on a theory about ThreadingMixIn retaining Thread
+    objects. It was applied without measuring and it did not work; the next run leaked identically.
+    tools/leak_probe.py exists so the next such claim is checked in a minute rather than a
+    tournament.
+
+    THREADS BOUGHT NOTHING HERE. The game is a sequential client: it asks for one decision and
+    blocks until it gets it, so there is never a second request in flight for this server to
+    overlap. Concurrency was answering a question nobody asked, and its failure mode cost a run.
+    Multiple games mean multiple sidecars on multiple ports, which is what PPO already does.
+    """
 
 
 class Handler(BaseHTTPRequestHandler):
-    # KEEP-ALIVE AND NO NAGLE. BaseHTTPRequestHandler speaks HTTP/1.0 by default, so the socket
-    # is torn down and rebuilt for EVERY decision -- a full TCP handshake per action, thousands of
-    # times a match. HTTP/1.1 reuses the connection (Content-Length is already sent on every
-    # reply, which is what makes that safe).
+    # HTTP/1.0, the default. Keep-alive was tried and reverted: GameMaker's client does not hold
+    # the connection, so every episode end reset a socket the server was still holding and threw
+    # ConnectionResetError [WinError 10054] in a flood. It bought ~75ms a decision and cost a run.
     #
-    # disable_nagle_algorithm sets TCP_NODELAY. Nagle holds a small write back waiting for more
-    # data while the peer's delayed-ACK holds the acknowledgement waiting for a response -- the
-    # classic ~40ms stall, and a request/response pair of a few hundred bytes is exactly the
-    # shape that triggers it.
-    protocol_version = "HTTP/1.1"
+    # TCP_NODELAY stays -- it is the half that was actually helping. Nagle holds a small write
+    # waiting for more data while the peer's delayed ACK waits for a response: the classic ~40ms
+    # stall on request/response pairs this size.
     disable_nagle_algorithm = True
+
+    def handle_one_request(self):
+        # A game exiting mid-connection is NORMAL -- an episode ending is a process ending.
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            self.close_connection = True
 
     def log_message(self, *a):
         pass

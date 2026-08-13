@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 data/
 runs/
+runs/
+*.hml
+CONFORMANCE*.txt
+ROUNDTRIP.txt
