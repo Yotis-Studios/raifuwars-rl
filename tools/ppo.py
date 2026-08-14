@@ -114,6 +114,11 @@ def main():
     ap.add_argument("--maps", default="",
                     help="comma-separated boards, cycled across envs -- training on one map is "
                          "how the 4B ended up losing 20pp of move accuracy off its trained board")
+    # CAPACITY CONTROL. The default net is ~58K parameters over 33+26 hand-crafted floats, and the
+    # claim that this is already ample is an assertion until someone tests it. These exist so the
+    # bigger-net arm is one flag rather than a fork.
+    ap.add_argument("--hidden", type=int, default=128)
+    ap.add_argument("--embed", type=int, default=64)
     ap.add_argument("--runner", default=os.environ.get("RW_RUNNER", ""))
     ap.add_argument("--game", default=os.environ.get("RW_GAME", ""))
     # THE ONLY THING --sim CHANGES IS WHERE THE TRANSITIONS COME FROM. SimEnv has the same
@@ -131,7 +136,7 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     device = torch.device(args.device)
-    net = ActionScorer().to(device)
+    net = ActionScorer(hidden=args.hidden, embed=args.embed).to(device)
     if args.init:
         blob = torch.load(args.init, map_location=device, weights_only=False)
         net.load_state_dict(blob["model"] if "model" in blob else blob)
