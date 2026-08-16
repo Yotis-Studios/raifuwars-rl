@@ -36,6 +36,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from raifuwars_rl.features import D_ACTION, D_STATE               # noqa: E402
 from raifuwars_rl.features import encode_actions, encode_state    # noqa: E402
 from raifuwars_rl.policy import ActionScorer                      # noqa: E402
 
@@ -143,9 +144,34 @@ class Handler(BaseHTTPRequestHandler):
 class Policy:
     def __init__(self, ckpt_path, temperature=0.0, device="cpu"):
         blob = torch.load(ckpt_path, map_location=device, weights_only=False)
-        self.net = ActionScorer().to(device)
-        self.net.load_state_dict(blob["model"] if "model" in blob else blob)
+        sd = blob["model"] if isinstance(blob, dict) and "model" in blob else blob
+
+        # BUILD THE NET THE CHECKPOINT WAS TRAINED AS, read from its own first layer. The runs are
+        # not one architecture -- `ppo-bignet` is 256/128 -- so the constructor defaults load some
+        # checkpoints and throw on others.
+        d_state = sd["state_tower.0.weight"].shape[1]
+        d_action = sd["action_tower.0.weight"].shape[1]
+        hidden = sd["state_tower.0.weight"].shape[0]
+        embed = sd["state_tower.2.weight"].shape[0]
+
+        # THE FEATURE WIDTH IS THE ONE THAT FAILS QUIETLY, and it is checked for that reason. A
+        # wrong hidden size raises on every layer, so you find out. A checkpoint trained with
+        # RW_FEAT_COVER=1 is 35/28 and, in a process that encodes 33/27, has towers of a shape that
+        # simply reads the wrong numbers -- a confident policy playing badly with nothing to show
+        # for it. The flag is fixed at the first import of `features` and cannot be changed after.
+        if (d_state, d_action) != (D_STATE, D_ACTION):
+            raise SystemExit(
+                "%s was trained on %d/%d features but this process encodes %d/%d.\n"
+                "Set RW_FEAT_COVER=%s before starting serve.py."
+                % (ckpt_path, d_state, d_action, D_STATE, D_ACTION,
+                   "1" if d_state > 33 else "0"))
+
+        self.net = ActionScorer(d_state=d_state, d_action=d_action,
+                                hidden=hidden, embed=embed).to(device)
+        self.net.load_state_dict(sd)
         self.net.eval()
+        self.arch = "%d/%d feat, %d/%d wide, %s params" % (
+            d_state, d_action, hidden, embed, "{:,}".format(sum(v.numel() for v in sd.values())))
         self.device = torch.device(device)
         self.temperature = temperature
         self.weight_mode = blob.get("weight_mode", "?") if isinstance(blob, dict) else "?"
@@ -185,8 +211,11 @@ def main():
     httpd.tag = args.tag
     httpd.stats = {"acts": 0, "ms": 0.0, "errors": 0, "empty_offers": 0}
 
-    print("[serve] %s (weight=%s, temperature=%g) on http://127.0.0.1:%d"
-          % (os.path.basename(args.checkpoint), policy.weight_mode, args.temperature, args.port),
+    # The architecture is printed because it is inferred rather than declared: if you loaded the
+    # wrong checkpoint for the RW_FEAT_COVER you set, this line is where you see it.
+    print("[serve] %s (%s, weight=%s, temperature=%g) on http://127.0.0.1:%d"
+          % (os.path.basename(args.checkpoint), policy.arch, policy.weight_mode,
+             args.temperature, args.port),
           flush=True)
     try:
         httpd.serve_forever()
