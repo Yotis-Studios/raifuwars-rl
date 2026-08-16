@@ -95,6 +95,22 @@ function it came from, in the source.
   with a 10% accuracy penalty) but cannot be placed or destroyed, since both are card effects.
 - **Coins**, achievements, chat, the online protocol, teams beyond equal blocks.
 - **Procedural vegetation is approximated, not reproduced.** See below.
+- **The map is not in the state the trainer sees.** `driver.hml` sends `board` as
+  `{width, height, points}`; the game's Warrior payload also carries `ascii` and `legend`. So a
+  policy trained here is blind to terrain **that is nonetheless affecting its hit rolls** — cover
+  is mechanically present and perceptually absent. Anything in `raifuwars_rl.features` derived from
+  the board reads zero: measured, `cover_density` is 0.000 across 6,001 sim states against 0.376 on
+  the game's Arboretum.
+
+  This cost an eight-hour run. `runs/ppo-cover` trained with `RW_FEAT_COVER=1` to test whether
+  Arboretum was a perception failure, and its three terrain features were constant zero throughout;
+  their first-layer weight columns are byte-identical between `best.pt` and `last.pt` while every
+  other column moved, because a permanently-zero input contributes exactly zero gradient.
+
+  It also means **sim win rates cannot rank policies on cover-heavy boards.** Against greedy on
+  Arboretum, five checkpoints score 73.8–79.0% here; the same five spread 12–50% in the real game.
+  Before the next terrain run: emit `board.ascii`, and check `cover_density` is non-zero on a live
+  sim state before committing GPU hours to it.
 
 ## Conformance
 
